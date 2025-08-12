@@ -7,8 +7,6 @@ A minimal **.NET 8** solution to demo **GitHub Copilot’s agentic workflow** (p
 - Tests project + CI skeleton
 - Deliberately incomplete with clear TODOs you’ll finish using Copilot
 
-> For prompts and tasks, see **[PROMPTS.md](PROMPTS.md)**.
-
 ---
 
 ## Architecture (thin, on purpose)
