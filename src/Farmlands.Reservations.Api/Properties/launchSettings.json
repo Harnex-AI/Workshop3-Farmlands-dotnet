@@ -1,0 +1,14 @@
+
+{
+  "profiles": {
+    "Farmlands.Reservations.Api": {
+      "commandName": "Project",
+      "dotnetRunMessages": true,
+      "applicationUrl": "http://localhost:5082",
+      "environmentVariables": {
+        "ASPNETCORE_ENVIRONMENT": "Development",
+        "INVENTORY_URL": "http://localhost:5081"
+      }
+    }
+  }
+}
