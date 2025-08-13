@@ -2,6 +2,8 @@
 using Farmlands.Shared.Contracts;
 using Farmlands.Shared.Messaging;
 using Microsoft.OpenApi.Models;
+using Polly;
+using Polly.Extensions.Http;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddEndpointsApiExplorer();
@@ -10,9 +12,26 @@ builder.Services.AddSwaggerGen(c =>
     c.SwaggerDoc("v1", new OpenApiInfo { Title = "Farmlands Reservations API", Version = "v1" });
 });
 
-// TODO: Replace FakeInventoryClient with HttpInventoryClient that calls Inventory API via HttpClient.
-// Use env var INVENTORY_URL (default http://localhost:5081).
-builder.Services.AddSingleton<IInventoryClient, FakeInventoryClient>();
+// Get inventory URL from environment variable, default to localhost
+var inventoryUrl = builder.Configuration["INVENTORY_URL"] ?? "http://localhost:5081";
+
+// Configure HttpClient with Polly retry policy
+var retryPolicy = HttpPolicyExtensions
+    .HandleTransientHttpError()
+    .WaitAndRetryAsync(
+        retryCount: 3,
+        sleepDurationProvider: retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)),
+        onRetry: (outcome, timespan, retryCount, context) =>
+        {
+            Console.WriteLine($"Retry {retryCount} for {context.OperationKey} in {timespan}");
+        });
+
+builder.Services.AddHttpClient<IInventoryClient, HttpInventoryClient>(client =>
+{
+    client.BaseAddress = new Uri(inventoryUrl);
+    client.Timeout = TimeSpan.FromSeconds(30);
+})
+.AddPolicyHandler(retryPolicy);
 
 // TODO: Add Idempotency middleware based on 'Idempotency-Key' header.
 builder.Services.AddSingleton<IMessageBus, ConsoleMessageBus>();
@@ -24,25 +43,42 @@ app.UseSwaggerUI();
 
 app.MapPost("/reservations", async (ReservationRequest req, IInventoryClient inv, IMessageBus bus, CancellationToken ct) =>
 {
-    // 1) Check stock
-    var snapshot = await inv.GetAsync(req.StoreId, req.Sku, ct);
-    if (snapshot.Quantity < req.Quantity)
+    try
     {
-        return Results.BadRequest(new { error = "Insufficient stock" });
+        // 1) Check stock
+        var snapshot = await inv.GetAsync(req.StoreId, req.Sku, ct);
+        if (snapshot.Quantity < req.Quantity)
+        {
+            return Results.BadRequest(new { error = "Insufficient stock" });
+        }
+
+        // 2) Decrement stock
+        var updated = await inv.AdjustAsync(req.StoreId, req.Sku, -req.Quantity, ct);
+
+        // 3) Emit replenish event if below threshold
+        const int threshold = 5;
+        if (updated.Quantity < threshold)
+        {
+            await bus.PublishAsync(new ReplenishRequested(req.StoreId, req.Sku, updated.Quantity, threshold), ct);
+        }
+
+        // 4) Return reservation
+        return Results.Created($"/reservations/{Guid.NewGuid()}", new ReservationResponse(Guid.NewGuid(), "Created"));
     }
-
-    // 2) Decrement stock
-    var updated = await inv.AdjustAsync(req.StoreId, req.Sku, -req.Quantity, ct);
-
-    // 3) Emit replenish event if below threshold
-    const int threshold = 5;
-    if (updated.Quantity < threshold)
+    catch (HttpRequestException ex)
     {
-        await bus.PublishAsync(new ReplenishRequested(req.StoreId, req.Sku, updated.Quantity, threshold), ct);
+        return Results.Problem(
+            title: "Service Unavailable",
+            detail: "Unable to communicate with inventory service. Please try again later.",
+            statusCode: 503);
     }
-
-    // 4) Return reservation
-    return Results.Created($"/reservations/{Guid.NewGuid()}", new ReservationResponse(Guid.NewGuid(), "Created"));
+    catch (TaskCanceledException) when (ct.IsCancellationRequested)
+    {
+        return Results.Problem(
+            title: "Request Timeout",
+            detail: "The request was cancelled.",
+            statusCode: 408);
+    }
 })
 .WithName("CreateReservation");
 
@@ -83,7 +119,73 @@ public sealed class FakeInventoryClient : IInventoryClient
     }
 }
 
-// TODO: Implement HttpInventoryClient : IInventoryClient that uses HttpClient.
-// - BaseAddress from env INVENTORY_URL (default http://localhost:5081).
-// - GET /inventory/{storeId}/{sku} and POST /inventory/adjust.
-// - Add Polly retry (e.g., 3 attempts, exponential backoff).
+public sealed class HttpInventoryClient : IInventoryClient
+{
+    private readonly HttpClient _httpClient;
+
+    public HttpInventoryClient(HttpClient httpClient)
+    {
+        _httpClient = httpClient;
+    }
+
+    public async Task<InventoryQueryResponse> GetAsync(string storeId, string sku, CancellationToken ct = default)
+    {
+        try
+        {
+            var response = await _httpClient.GetAsync($"/inventory/{storeId}/{sku}", ct);
+            
+            if (!response.IsSuccessStatusCode)
+            {
+                throw new HttpRequestException($"Failed to get inventory: {response.StatusCode}");
+            }
+
+            var result = await response.Content.ReadFromJsonAsync<InventoryQueryResponse>(ct);
+            return result ?? new InventoryQueryResponse(storeId, sku, 0);
+        }
+        catch (HttpRequestException)
+        {
+            throw;
+        }
+        catch (TaskCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new HttpRequestException($"Error communicating with inventory service", ex);
+        }
+    }
+
+    public async Task<InventoryQueryResponse> AdjustAsync(string storeId, string sku, int delta, CancellationToken ct = default)
+    {
+        try
+        {
+            var request = new InventoryAdjustRequest(storeId, sku, delta);
+            var response = await _httpClient.PostAsJsonAsync("/inventory/adjust", request, ct);
+            
+            if (!response.IsSuccessStatusCode)
+            {
+                if (response.StatusCode == System.Net.HttpStatusCode.BadRequest)
+                {
+                    throw new InvalidOperationException("Negative quantity not allowed");
+                }
+                throw new HttpRequestException($"Failed to adjust inventory: {response.StatusCode}");
+            }
+
+            var result = await response.Content.ReadFromJsonAsync<InventoryQueryResponse>(ct);
+            return result ?? new InventoryQueryResponse(storeId, sku, 0);
+        }
+        catch (HttpRequestException)
+        {
+            throw;
+        }
+        catch (TaskCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new HttpRequestException($"Error communicating with inventory service", ex);
+        }
+    }
+}
